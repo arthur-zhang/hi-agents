@@ -70,7 +70,7 @@ async function testWebSocket() {
     setTimeout(() => {
       console.log("Timeout, closing connection...");
       ws.close();
-    }, 30000);
+    }, 300000);
   });
 }
 

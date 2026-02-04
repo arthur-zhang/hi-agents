@@ -1,4 +1,4 @@
-use agent_client_protocol::{ContentBlock, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, StopReason};
+use agent_client_protocol::{AgentSide, ClientRequest, ContentBlock as AcpContentBlock, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, Side, StopReason};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -21,7 +22,7 @@ use uuid::Uuid;
 
 use crate::claude::process_handle::ProcessHandle;
 use crate::claude::transport::transport2::SubprocessCLITransport;
-use crate::claude::types::{ClaudeAgentOptions, InputMessage};
+use crate::claude::types::{ClaudeAgentOptions, ContentBlock, InputMessage, ProtocolMessage};
 
 // ============================================================================
 // JSON-RPC Types
@@ -196,16 +197,30 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
             }
         };
 
-        // Route by method
-        let response = match request.method.as_str() {
-            "session/new" => {
-                handle_session_new(&request, &sessions, &mut current_session_id, &mut claude_stdin, &mut process_handle, &tx, &notification_id).await
+        // Parse into ClientRequest using AgentSide::decode_request
+        let raw_params = request.params.to_string();
+        let raw_value = RawValue::from_string(raw_params).ok();
+        let client_request = match AgentSide::decode_request(&request.method, raw_value.as_deref()) {
+            Ok(req) => req,
+            Err(e) => {
+                let code = if e.message.contains("Method not found") { METHOD_NOT_FOUND } else { INVALID_REQUEST };
+                let _ = tx.send(OutgoingMessage::Response(
+                    JsonRpcResponse::error(request.id, code, e.message)
+                )).await;
+                continue;
             }
-            "session/prompt" => {
-                handle_session_prompt(&request, &mut claude_stdin, &current_session_id).await
+        };
+
+        // Route by ClientRequest variant
+        let response = match client_request {
+            ClientRequest::NewSessionRequest(req) => {
+                handle_session_new(request.id.clone(), req, &sessions, &mut current_session_id, &mut claude_stdin, &mut process_handle, &tx, &notification_id).await
+            }
+            ClientRequest::PromptRequest(req) => {
+                handle_session_prompt(request.id.clone(), req, &mut claude_stdin, &current_session_id).await
             }
             _ => {
-                JsonRpcResponse::error(request.id, METHOD_NOT_FOUND, format!("Method not found: {}", request.method))
+                JsonRpcResponse::error(request.id, METHOD_NOT_FOUND, format!("Method not implemented: {}", request.method))
             }
         };
 
@@ -235,7 +250,8 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
 // ============================================================================
 
 async fn handle_session_new(
-    request: &JsonRpcRequest,
+    id: RequestId,
+    req: NewSessionRequest,
     sessions: &SessionManager,
     current_session_id: &mut Option<String>,
     claude_stdin: &mut Option<ChildStdin>,
@@ -243,14 +259,6 @@ async fn handle_session_new(
     tx: &mpsc::Sender<OutgoingMessage>,
     notification_id: &Arc<AtomicI64>,
 ) -> JsonRpcResponse {
-    // Parse NewSessionRequest from params
-    let req: NewSessionRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            return JsonRpcResponse::error(request.id.clone(), INVALID_REQUEST, format!("Invalid params: {}", e));
-        }
-    };
-
     let session_id = Uuid::new_v4().to_string();
 
     // Store session state
@@ -279,28 +287,21 @@ async fn handle_session_new(
             tracing::info!("Claude process started for session {}", session_id);
         }
         Err(e) => {
-            return JsonRpcResponse::error(request.id.clone(), INTERNAL_ERROR, format!("Failed to start Claude: {}", e));
+            return JsonRpcResponse::error(id.clone(), INTERNAL_ERROR, format!("Failed to start Claude: {}", e));
         }
     }
 
     // Return NewSessionResponse
     let response = NewSessionResponse::new(session_id);
-    JsonRpcResponse::success(request.id.clone(), response)
+    JsonRpcResponse::success(id, response)
 }
 
 async fn handle_session_prompt(
-    request: &JsonRpcRequest,
+    id: RequestId,
+    req: PromptRequest,
     claude_stdin: &mut Option<ChildStdin>,
     current_session_id: &Option<String>,
 ) -> JsonRpcResponse {
-    // Parse PromptRequest from params
-    let req: PromptRequest = match serde_json::from_value(request.params.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            return JsonRpcResponse::error(request.id.clone(), INVALID_REQUEST, format!("Invalid params: {}", e));
-        }
-    };
-
     if let (Some(stdin), Some(session_id)) = (claude_stdin, current_session_id) {
         // Convert ContentBlocks to string for Claude input
         let content = prompt_to_string(&req.prompt);
@@ -308,14 +309,14 @@ async fn handle_session_prompt(
         let json = serde_json::to_string(&input_msg).unwrap() + "\n";
 
         if let Err(e) = stdin.write_all(json.as_bytes()).await {
-            return JsonRpcResponse::error(request.id.clone(), INTERNAL_ERROR, format!("Failed to send to Claude: {}", e));
+            return JsonRpcResponse::error(id.clone(), INTERNAL_ERROR, format!("Failed to send to Claude: {}", e));
         }
 
         // Return PromptResponse (actual response will come via notifications)
         let response = PromptResponse::new(StopReason::EndTurn);
-        JsonRpcResponse::success(request.id.clone(), response)
+        JsonRpcResponse::success(id, response)
     } else {
-        JsonRpcResponse::error(request.id.clone(), INVALID_REQUEST, "No active session")
+        JsonRpcResponse::error(id, INVALID_REQUEST, "No active session")
     }
 }
 
@@ -364,18 +365,38 @@ async fn forward_claude_output(
                     continue;
                 }
 
-                // Parse as JSON and forward as notification
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&line) {
-                    // Send as session/update notification
-                    let notification = JsonRpcNotification::new(
-                        "session/update",
-                        serde_json::json!({
-                            "sessionId": session_id,
-                            "data": data
-                        }),
-                    );
-                    if tx.send(OutgoingMessage::Notification(notification)).await.is_err() {
-                        break;
+                // Parse as ProtocolMessage and convert to SessionNotification
+                match serde_json::from_str::<ProtocolMessage>(&line) {
+                    Ok(msg) => {
+                        let notifications = protocol_message_to_notifications(&session_id, msg);
+                        for notification in notifications {
+                            let json_notification = JsonRpcNotification::new(
+                                "session/update",
+                                notification,
+                            );
+                            if tx.send(OutgoingMessage::Notification(json_notification)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse ProtocolMessage: {} - line: {}", e, &line);
+                        // Fallback: send raw data
+                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&line) {
+                            let notification = JsonRpcNotification::new(
+                                "session/update",
+                                serde_json::json!({
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "raw",
+                                        "data": data
+                                    }
+                                }),
+                            );
+                            if tx.send(OutgoingMessage::Notification(notification)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -390,14 +411,172 @@ async fn forward_claude_output(
 }
 
 // ============================================================================
+// Protocol Message to ACP Notification Conversion
+// ============================================================================
+
+/// Convert ProtocolMessage to JSON notifications following ACP SessionNotification format
+fn protocol_message_to_notifications(session_id: &str, msg: ProtocolMessage) -> Vec<serde_json::Value> {
+    let mut notifications = Vec::new();
+
+    println!("----------");
+    println!("{:#?}", msg);
+    println!("----------");
+    match msg {
+        ProtocolMessage::Assistant { message, .. } => {
+            // Process assistant message content blocks
+            for block in message.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        notifications.push(serde_json::json!({
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {
+                                    "type": "text",
+                                    "text": text
+                                }
+                            }
+                        }));
+                    }
+                    ContentBlock::Thinking { thinking, .. } => {
+                        notifications.push(serde_json::json!({
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_thought_chunk",
+                                "content": {
+                                    "type": "text",
+                                    "text": thinking
+                                }
+                            }
+                        }));
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        notifications.push(serde_json::json!({
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": id,
+                                "title": name,
+                                "status": "pending",
+                                "rawInput": input
+                            }
+                        }));
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        let status = if is_error.unwrap_or(false) { "failed" } else { "completed" };
+                        let raw_output = content.map(|c| match c {
+                            crate::claude::types::ContentBlockContent::String(s) => serde_json::Value::String(s),
+                            crate::claude::types::ContentBlockContent::Array(arr) => serde_json::Value::Array(arr),
+                        });
+                        notifications.push(serde_json::json!({
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "tool_call_update",
+                                "toolCallId": tool_use_id,
+                                "status": status,
+                                "rawOutput": raw_output
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+        ProtocolMessage::Stream(stream_event) => {
+            // Handle stream events (partial updates)
+            if let Some(event) = stream_event.event.as_object() {
+                if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
+                    match event_type {
+                        "content_block_start" | "content_block_delta" => {
+                            // Extract content from the event
+                            let content_block = event.get("content_block").or_else(|| event.get("delta"));
+                            if let Some(block) = content_block {
+                                if let Some(block_type) = block.get("type").and_then(|v| v.as_str()) {
+                                    match block_type {
+                                        "text" | "text_delta" => {
+                                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                                notifications.push(serde_json::json!({
+                                                    "sessionId": session_id,
+                                                    "update": {
+                                                        "sessionUpdate": "agent_message_chunk",
+                                                        "content": {
+                                                            "type": "text",
+                                                            "text": text
+                                                        }
+                                                    }
+                                                }));
+                                            }
+                                        }
+                                        "thinking" | "thinking_delta" => {
+                                            if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+                                                notifications.push(serde_json::json!({
+                                                    "sessionId": session_id,
+                                                    "update": {
+                                                        "sessionUpdate": "agent_thought_chunk",
+                                                        "content": {
+                                                            "type": "text",
+                                                            "text": thinking
+                                                        }
+                                                    }
+                                                }));
+                                            }
+                                        }
+                                        "tool_use" => {
+                                            if let (Some(id), Some(name)) = (
+                                                block.get("id").and_then(|v| v.as_str()),
+                                                block.get("name").and_then(|v| v.as_str()),
+                                            ) {
+                                                let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                                                notifications.push(serde_json::json!({
+                                                    "sessionId": session_id,
+                                                    "update": {
+                                                        "sessionUpdate": "tool_call",
+                                                        "toolCallId": id,
+                                                        "title": name,
+                                                        "status": "pending",
+                                                        "rawInput": input
+                                                    }
+                                                }));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        ProtocolMessage::Result(result) => {
+            // Result messages indicate end of turn - we don't need to send notifications for these
+            // The PromptResponse will be sent separately
+            tracing::debug!("Result message: subtype={}, is_error={}", result.subtype, result.is_error);
+        }
+        ProtocolMessage::System(system) => {
+            // System messages are mostly internal - log them but don't forward
+            tracing::debug!("System message: subtype={}", system.subtype);
+        }
+        ProtocolMessage::User { .. } => {
+            // User messages are echoes of input - typically don't need to forward
+        }
+        ProtocolMessage::ControlRequest { .. } | ProtocolMessage::ControlResponse { .. } => {
+            // Control messages are internal protocol - don't forward
+        }
+    }
+
+    notifications
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
-fn prompt_to_string(blocks: &[ContentBlock]) -> String {
+fn prompt_to_string(blocks: &[AcpContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text(text_content) => Some(text_content.text.clone()),
+            AcpContentBlock::Text(text_content) => Some(text_content.text.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()
