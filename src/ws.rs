@@ -1,4 +1,4 @@
-use agent_client_protocol::{NewSessionRequest, NewSessionResponse};
+use agent_client_protocol::{ContentBlock, NewSessionRequest, NewSessionResponse, PromptRequest};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -30,7 +30,7 @@ use crate::claude::types::{ClaudeAgentOptions, InputMessage};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     NewSession(NewSessionRequest),
-    UserMessage { content: String },
+    Prompt(PromptRequest),
 }
 
 #[derive(Debug, Serialize)]
@@ -139,11 +139,12 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
                     }
                 }
             }
-            Ok(ClientMessage::UserMessage { content }) => {
+            Ok(ClientMessage::Prompt(req)) => {
                 if let (Some(stdin), Some(session_id)) =
                     (&mut claude_stdin, &current_session_id)
                 {
-                    // Send message to Claude process
+                    // Convert ContentBlocks to string for Claude input
+                    let content = prompt_to_string(&req.prompt);
                     let input_msg = InputMessage::user(&content, session_id.clone());
                     let json = serde_json::to_string(&input_msg).unwrap() + "\n";
                     if let Err(e) = stdin.write_all(json.as_bytes()).await {
@@ -240,4 +241,19 @@ async fn forward_claude_output(stdout: ChildStdout, tx: mpsc::Sender<ServerMessa
     }
 
     tracing::info!("Claude output stream ended for session {}", session_id);
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn prompt_to_string(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text_content) => Some(text_content.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
