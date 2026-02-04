@@ -1,5 +1,6 @@
 mod codex;
 mod claude;
+mod ws;
 
 use agent_client_protocol::{NewSessionResponse, RequestPermissionRequest, SessionUpdate};
 use uuid::uuid;
