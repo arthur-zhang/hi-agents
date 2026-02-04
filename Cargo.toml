@@ -19,11 +19,8 @@ futures = "0.3"
 chrono = "0.4"
 axum = { version = "0.7", features = ["ws"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-claude-agent-sdk = { path = "../claude" }
-codex = { path = "../codex" }
 async-stream = "0.3"
 tower-http = { version = "0.6", features = ["fs"] }
 dashmap = "6"
 rust-embed = "8.5"
 mime_guess = "2.0"
-agent = { path = "../agent" }
