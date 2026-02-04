@@ -29,7 +29,7 @@ pub use hooks::{
 };
 pub use mcp::{McpServerConfig, SdkPluginConfig};
 pub use messages::{
-    AssistantMessage, AssistantMessageError, ContentBlock, ContentBlockContent, InputMessage,
+    AssistantMessage, AssistantMessageError, ContentBlock, ContentBlockContent, ImageSource, InputMessage,
     Message, MessageContent, ResultMessage, StreamEvent, SystemMessage, UserMessage,
 };
 pub use permissions::{

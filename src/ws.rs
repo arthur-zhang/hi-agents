@@ -1,5 +1,7 @@
 use agent_client_protocol::{
-    AgentSide, ClientRequest, ContentBlock as AcpContentBlock, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionNotification, Side, StopReason
+    AgentSide, ClientRequest, ContentBlock as AcpContentBlock, ContentChunk, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, SessionNotification, SessionUpdate, Side,
+    StopReason, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use axum::{
     extract::{
@@ -22,9 +24,12 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use uuid::Uuid;
 
-use crate::claude::transport::transport2::SubprocessCLITransport;
-use crate::claude::types::{ClaudeAgentOptions, ContentBlock, InputMessage, ProtocolMessage};
 use crate::claude::process_handle::ProcessHandle;
+use crate::claude::transport::transport2::SubprocessCLITransport;
+use crate::claude::types::{
+    ClaudeAgentOptions, ContentBlock, ContentBlockContent, ImageSource, InputMessage,
+    ProtocolMessage,
+};
 
 // ============================================================================
 // JSON-RPC Types
@@ -450,6 +455,7 @@ async fn start_claude_process(
 ) -> Result<(ChildStdout, ChildStdin, ProcessHandle), String> {
     let mut options = ClaudeAgentOptions::new();
     options.cwd = Some(req.cwd.clone());
+    options.max_thinking_tokens = Some(50000);
 
     // Add session ID to extra args
     options
@@ -546,6 +552,9 @@ async fn handle_msg(
     _prompt_complete_tx: Arc<Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
     msg: ProtocolMessage,
 ) -> Result<Option<PromptResponse>, PromptError> {
+    println!("===========");
+    println!("handle_msg: {:?}", serde_json::to_string(&msg).unwrap());
+    println!("===========");
     match &msg {
         ProtocolMessage::System(system_message) => match system_message.subtype.as_str() {
             "init" => {
@@ -570,21 +579,37 @@ async fn handle_msg(
                         return Err(PromptError::AuthRequired);
                     }
                     if result_message.is_error {
-                        return Err(PromptError::Internal { message: result_text });
+                        return Err(PromptError::Internal {
+                            message: result_text,
+                        });
                     }
                     return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
                 }
                 "error_during_execution" => {
                     if result_message.is_error {
-                        let message = if errors_text.is_empty() { &result_message.subtype } else { &errors_text };
-                        return Err(PromptError::Internal { message: message.clone() });
+                        let message = if errors_text.is_empty() {
+                            &result_message.subtype
+                        } else {
+                            &errors_text
+                        };
+                        return Err(PromptError::Internal {
+                            message: message.clone(),
+                        });
                     }
                     return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
                 }
-                "error_max_budget_usd" | "error_max_turns" | "error_max_structured_output_retries" => {
+                "error_max_budget_usd"
+                | "error_max_turns"
+                | "error_max_structured_output_retries" => {
                     if result_message.is_error {
-                        let message = if errors_text.is_empty() { &result_message.subtype } else { &errors_text };
-                        return Err(PromptError::Internal { message: message.clone() });
+                        let message = if errors_text.is_empty() {
+                            &result_message.subtype
+                        } else {
+                            &errors_text
+                        };
+                        return Err(PromptError::Internal {
+                            message: message.clone(),
+                        });
                     }
                     return Ok(Some(PromptResponse::new(StopReason::MaxTurnRequests)));
                 }
@@ -594,25 +619,55 @@ async fn handle_msg(
                 }
             }
         }
-        ProtocolMessage::Stream(msg) => {
+        ProtocolMessage::Stream(stream_event) => {
             // Stream events - convert to notifications and send
-            // let notifications = protocol_message_to_notifications(session_id, msg);
-            // for notification in notifications {
-            //     let json_notification = JsonRpcNotification::new("session/update", notification);
-            //     if tx
-            //         .send(OutgoingMessage::Notification(json_notification))
-            //         .await
-            //         .is_err()
-            //     {
-            //         tracing::warn!("Failed to send stream notification");
-            //     }
-            // }
-            // return Ok(None);
-            todo!()
+            let mut tool_use_cache = ToolUseCache::new();
+            let notifications = stream_event_to_acp_notifications(
+                stream_event,
+                session_id,
+                &mut tool_use_cache,
+            );
+
+            for notification in notifications {
+                let json_notification = JsonRpcNotification::new("session/update", notification);
+                if tx
+                    .send(OutgoingMessage::Notification(json_notification))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to send stream notification");
+                }
+            }
+            return Ok(None);
         }
-        ProtocolMessage::Assistant { .. } => {
+        ProtocolMessage::Assistant {
+            message,
+            parent_tool_use_id: _,
+            session_id: _,
+            uuid: _,
+        } => {
             // Assistant messages - convert to notifications and send
-            let notifications = protocol_message_to_notifications(session_id, msg);
+            // Filter out text and thinking blocks (handled by stream events)
+            let filtered_content: Vec<ContentBlock> = message
+                .content
+                .clone()
+                .into_iter()
+                .filter(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Text { .. } | ContentBlock::Thinking { .. }
+                    )
+                })
+                .collect();
+
+            let mut tool_use_cache = ToolUseCache::new();
+            let notifications = to_acp_notifications(
+                AcpContent::Blocks(filtered_content),
+                MessageRole::Assistant,
+                session_id,
+                &mut tool_use_cache,
+            );
+
             for notification in notifications {
                 let json_notification = JsonRpcNotification::new("session/update", notification);
                 if tx
@@ -625,8 +680,86 @@ async fn handle_msg(
             }
             return Ok(None);
         }
-        ProtocolMessage::User { .. } => {
-            // User messages are echoes of input - typically don't need to forward
+        ProtocolMessage::User {
+            message,
+            parent_tool_use_id: _,
+            session_id: _,
+            uuid: _,
+            tool_use_result: _,
+        } => {
+            // Handle special local command output (slash commands like /compact, /context)
+            if let crate::claude::types::MessageContent::String(ref content) = message.content {
+                if content.contains("<local-command-stdout>") {
+                    // Handle /context by sending its reply as regular agent message
+                    if content.contains("Context Usage") {
+                        let cleaned = content
+                            .replace("<local-command-stdout>", "")
+                            .replace("</local-command-stdout>", "");
+                        let mut tool_use_cache = ToolUseCache::new();
+                        let notifications = to_acp_notifications(
+                            AcpContent::String(cleaned),
+                            MessageRole::Assistant,
+                            session_id,
+                            &mut tool_use_cache,
+                        );
+                        for notification in notifications {
+                            let json_notification =
+                                JsonRpcNotification::new("session/update", notification);
+                            if tx
+                                .send(OutgoingMessage::Notification(json_notification))
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!("Failed to send context notification");
+                            }
+                        }
+                    }
+                    tracing::info!("Local command stdout: {}", content);
+                    return Ok(None);
+                }
+
+                if content.contains("<local-command-stderr>") {
+                    tracing::error!("Local command stderr: {}", content);
+                    return Ok(None);
+                }
+            }
+
+            // Skip user messages that are just text (echoes of input)
+            // Only forward user messages with tool results or other non-text content
+            let should_skip = match &message.content {
+                crate::claude::types::MessageContent::String(_) => true,
+                crate::claude::types::MessageContent::Blocks(blocks) => {
+                    // Skip if only one text block
+                    blocks.len() == 1 && matches!(blocks.first(), Some(ContentBlock::Text { .. }))
+                }
+            };
+
+            if should_skip {
+                return Ok(None);
+            }
+
+            // Forward non-text user content (tool results, etc.)
+            let content = match &message.content {
+                crate::claude::types::MessageContent::String(s) => AcpContent::String(s.clone()),
+                crate::claude::types::MessageContent::Blocks(blocks) => {
+                    AcpContent::Blocks(blocks.clone())
+                }
+            };
+
+            let mut tool_use_cache = ToolUseCache::new();
+            let notifications =
+                to_acp_notifications(content, MessageRole::User, session_id, &mut tool_use_cache);
+
+            for notification in notifications {
+                let json_notification = JsonRpcNotification::new("session/update", notification);
+                if tx
+                    .send(OutgoingMessage::Notification(json_notification))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to send user notification");
+                }
+            }
             return Ok(None);
         }
         ProtocolMessage::ControlRequest { .. } | ProtocolMessage::ControlResponse { .. } => {
@@ -636,12 +769,331 @@ async fn handle_msg(
     }
 }
 
-
-
-fn to_acp_notifications()->Vec<SessionNotification>{
-    todo!()
+/// Role for message content
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    Assistant,
+    User,
 }
 
+/// Content that can be converted to ACP notifications
+#[derive(Debug, Clone)]
+pub enum AcpContent {
+    String(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+impl From<String> for AcpContent {
+    fn from(s: String) -> Self {
+        AcpContent::String(s)
+    }
+}
+
+impl From<&str> for AcpContent {
+    fn from(s: &str) -> Self {
+        AcpContent::String(s.to_string())
+    }
+}
+
+impl From<Vec<ContentBlock>> for AcpContent {
+    fn from(blocks: Vec<ContentBlock>) -> Self {
+        AcpContent::Blocks(blocks)
+    }
+}
+
+/// Cache for tool use information
+pub type ToolUseCache = std::collections::HashMap<String, ToolUseCacheEntry>;
+
+/// Entry in the tool use cache
+#[derive(Debug, Clone)]
+pub struct ToolUseCacheEntry {
+    pub tool_type: ToolUseType,
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+/// Type of tool use
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolUseType {
+    ToolUse,
+    ServerToolUse,
+    McpToolUse,
+}
+
+/// Convert content to ACP SessionNotifications.
+/// This is a Rust port of the TypeScript `toAcpNotifications` function.
+pub fn to_acp_notifications(
+    content: AcpContent,
+    role: MessageRole,
+    session_id: &str,
+    tool_use_cache: &mut ToolUseCache,
+) -> Vec<SessionNotification> {
+    match content {
+        AcpContent::String(text) => {
+            let update = match role {
+                MessageRole::Assistant => SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    AcpContentBlock::Text(agent_client_protocol::TextContent::new(&text)),
+                )),
+                MessageRole::User => SessionUpdate::UserMessageChunk(ContentChunk::new(
+                    AcpContentBlock::Text(agent_client_protocol::TextContent::new(&text)),
+                )),
+            };
+            vec![SessionNotification::new(session_id.to_string(), update)]
+        }
+        AcpContent::Blocks(blocks) => {
+            let mut output = Vec::new();
+
+            for block in blocks {
+                let update = content_block_to_session_update(block, role, tool_use_cache);
+                if let Some(u) = update {
+                    output.push(SessionNotification::new(session_id.to_string(), u));
+                }
+            }
+
+            output
+        }
+    }
+}
+
+/// Convert a single ContentBlock to a SessionUpdate
+fn content_block_to_session_update(
+    block: ContentBlock,
+    role: MessageRole,
+    tool_use_cache: &mut ToolUseCache,
+) -> Option<SessionUpdate> {
+    match block {
+        ContentBlock::Text { text } | ContentBlock::TextDelta { text } => {
+            let chunk = ContentChunk::new(AcpContentBlock::Text(
+                agent_client_protocol::TextContent::new(&text),
+            ));
+            Some(match role {
+                MessageRole::Assistant => SessionUpdate::AgentMessageChunk(chunk),
+                MessageRole::User => SessionUpdate::UserMessageChunk(chunk),
+            })
+        }
+        ContentBlock::Thinking { thinking, .. } | ContentBlock::ThinkingDelta { thinking } => {
+            let chunk = ContentChunk::new(AcpContentBlock::Text(
+                agent_client_protocol::TextContent::new(&thinking),
+            ));
+            Some(SessionUpdate::AgentThoughtChunk(chunk))
+        }
+        ContentBlock::Image { source } => {
+            let (data, mime_type, uri) = match source {
+                ImageSource::Base64 { data, media_type } => (data, media_type, None),
+                ImageSource::Url { url } => (String::new(), String::new(), Some(url)),
+            };
+            let mut image_content = agent_client_protocol::ImageContent::new(&data, &mime_type);
+            if let Some(u) = uri {
+                image_content = image_content.uri(u);
+            }
+            let chunk = ContentChunk::new(AcpContentBlock::Image(image_content));
+            Some(match role {
+                MessageRole::Assistant => SessionUpdate::AgentMessageChunk(chunk),
+                MessageRole::User => SessionUpdate::UserMessageChunk(chunk),
+            })
+        }
+        ContentBlock::ToolUse {
+            ref id,
+            ref name,
+            ref input,
+        }
+        | ContentBlock::ServerToolUse {
+            ref id,
+            ref name,
+            ref input,
+        }
+        | ContentBlock::McpToolUse {
+            ref id,
+            ref name,
+            ref input,
+        } => {
+            // Determine tool type
+            let tool_type = match &block {
+                ContentBlock::ServerToolUse { .. } => ToolUseType::ServerToolUse,
+                ContentBlock::McpToolUse { .. } => ToolUseType::McpToolUse,
+                _ => ToolUseType::ToolUse,
+            };
+
+            // Cache the tool use
+            tool_use_cache.insert(
+                id.clone(),
+                ToolUseCacheEntry {
+                    tool_type,
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                },
+            );
+
+            // Skip TodoWrite tool (handled separately for plan updates)
+            if name == "TodoWrite" {
+                return None;
+            }
+
+            // Create tool call notification
+            let raw_input = serde_json::to_value(input).ok();
+            let tool_call = ToolCall::new(id.clone(), name.clone())
+                .status(ToolCallStatus::Pending)
+                .raw_input(raw_input);
+
+            Some(SessionUpdate::ToolCall(tool_call))
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        }
+        | ContentBlock::McpToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            let cached = tool_use_cache.get(&tool_use_id);
+            if cached.is_none() {
+                tracing::error!(
+                    "[to_acp_notifications] Got a tool result for tool use that wasn't tracked: {}",
+                    tool_use_id
+                );
+                return None;
+            }
+
+            let cached = cached.unwrap();
+
+            // Skip TodoWrite results
+            if cached.name == "TodoWrite" {
+                return None;
+            }
+
+            let status = if is_error.unwrap_or(false) {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            };
+
+            let raw_output = content.as_ref().map(|c| match c {
+                ContentBlockContent::String(s) => serde_json::Value::String(s.clone()),
+                ContentBlockContent::Array(arr) => serde_json::Value::Array(arr.clone()),
+            });
+
+            let fields = ToolCallUpdateFields::new()
+                .status(status)
+                .raw_output(raw_output);
+
+            let update = ToolCallUpdate::new(tool_use_id, fields);
+
+            Some(SessionUpdate::ToolCallUpdate(update))
+        }
+        // Ignore unknown/other types
+        ContentBlock::Unknown => None,
+    }
+}
+
+/// Stream event types for parsing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StreamEventType {
+    ContentBlockStart {
+        content_block: ContentBlock,
+    },
+    ContentBlockDelta {
+        delta: ContentBlock,
+    },
+    MessageStart,
+    MessageDelta,
+    MessageStop,
+    ContentBlockStop,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Convert a StreamEvent to ACP SessionNotifications.
+/// This is a Rust port of the TypeScript `streamEventToAcpNotifications` function.
+pub fn stream_event_to_acp_notifications(
+    stream_event: &crate::claude::types::StreamEvent,
+    session_id: &str,
+    tool_use_cache: &mut ToolUseCache,
+) -> Vec<SessionNotification> {
+    // Parse the event JSON to determine the type
+    let event_type: Result<StreamEventType, _> = serde_json::from_value(stream_event.event.clone());
+
+    match event_type {
+        Ok(StreamEventType::ContentBlockStart { content_block }) => {
+            to_acp_notifications(
+                AcpContent::Blocks(vec![content_block]),
+                MessageRole::Assistant,
+                session_id,
+                tool_use_cache,
+            )
+        }
+        Ok(StreamEventType::ContentBlockDelta { delta }) => {
+            to_acp_notifications(
+                AcpContent::Blocks(vec![delta]),
+                MessageRole::Assistant,
+                session_id,
+                tool_use_cache,
+            )
+        }
+        // No content for these events
+        Ok(StreamEventType::MessageStart)
+        | Ok(StreamEventType::MessageDelta)
+        | Ok(StreamEventType::MessageStop)
+        | Ok(StreamEventType::ContentBlockStop)
+        | Ok(StreamEventType::Unknown) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("Failed to parse stream event: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Convert a ProtocolMessage to ACP SessionNotifications
+fn protocol_message_to_notifications(
+    session_id: &str,
+    msg: ProtocolMessage,
+) -> Vec<SessionNotification> {
+    // Create a temporary tool use cache for this conversion
+    // In a real implementation, this should be passed in and maintained across calls
+    let mut tool_use_cache = ToolUseCache::new();
+
+    match msg {
+        ProtocolMessage::Assistant { message, .. } => {
+            // Filter out text and thinking blocks (handled by stream events)
+            let filtered_content: Vec<ContentBlock> = message
+                .content
+                .into_iter()
+                .filter(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Text { .. } | ContentBlock::Thinking { .. }
+                    )
+                })
+                .collect();
+
+            to_acp_notifications(
+                AcpContent::Blocks(filtered_content),
+                MessageRole::Assistant,
+                session_id,
+                &mut tool_use_cache,
+            )
+        }
+        ProtocolMessage::User { message, .. } => match message.content {
+            crate::claude::types::MessageContent::String(s) => to_acp_notifications(
+                AcpContent::String(s),
+                MessageRole::User,
+                session_id,
+                &mut tool_use_cache,
+            ),
+            crate::claude::types::MessageContent::Blocks(blocks) => to_acp_notifications(
+                AcpContent::Blocks(blocks),
+                MessageRole::User,
+                session_id,
+                &mut tool_use_cache,
+            ),
+        },
+        _ => Vec::new(),
+    }
+}
 
 fn prompt_to_string(blocks: &[AcpContentBlock]) -> String {
     blocks
