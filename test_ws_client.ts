@@ -42,7 +42,7 @@ async function testWebSocket() {
         if (responseData.result.sessionId) {
           const promptRequest = createJsonRpcRequest("session/prompt", {
             sessionId: responseData.result.sessionId,
-            prompt: [{ type: "text", text: "Hello, Claude!" }],
+            prompt: [{ type: "text", text: "list files in current dir" }],
           });
           ws.send(JSON.stringify(promptRequest));
           console.log(`Sent prompt: ${JSON.stringify(promptRequest, null, 2)}`);

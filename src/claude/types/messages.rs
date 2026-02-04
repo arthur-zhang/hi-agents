@@ -21,11 +21,30 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    TextDelta {
+        text: String,
+    },
     Thinking {
         thinking: String,
         signature: String,
     },
+    ThinkingDelta {
+        thinking: String,
+    },
+    Image {
+        source: ImageSource,
+    },
     ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    McpToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
@@ -36,6 +55,29 @@ pub enum ContentBlock {
         content: Option<ContentBlockContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+    },
+    McpToolResult {
+        tool_use_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<ContentBlockContent>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
+    // Other types that we ignore
+    #[serde(other)]
+    Unknown,
+}
+
+/// Image source for image content blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    Base64 {
+        data: String,
+        media_type: String,
+    },
+    Url {
+        url: String,
     },
 }
 
