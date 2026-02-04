@@ -1,2 +1,2 @@
-mod transport2;
-mod stream;
+pub mod transport2;
+pub mod stream;
