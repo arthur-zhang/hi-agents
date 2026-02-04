@@ -1,3 +1,5 @@
+mod claude;
+mod codex;
 mod ws;
 
 use axum::{routing::get, Router};
