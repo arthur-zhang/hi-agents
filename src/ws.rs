@@ -1,8 +1,10 @@
-use agent_client_protocol::{AgentSide, ClientRequest, ContentBlock as AcpContentBlock, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, Side, StopReason};
+use agent_client_protocol::{
+    AgentSide, ClientRequest, ContentBlock as AcpContentBlock, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionNotification, Side, StopReason
+};
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
 };
@@ -16,13 +18,13 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use uuid::Uuid;
 
-use crate::claude::process_handle::ProcessHandle;
 use crate::claude::transport::transport2::SubprocessCLITransport;
 use crate::claude::types::{ClaudeAgentOptions, ContentBlock, InputMessage, ProtocolMessage};
+use crate::claude::process_handle::ProcessHandle;
 
 // ============================================================================
 // JSON-RPC Types
@@ -109,6 +111,7 @@ const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
 const METHOD_NOT_FOUND: i32 = -32601;
 const INTERNAL_ERROR: i32 = -32603;
+const AUTH_REQUIRED: i32 = -32001; // Custom error code for authentication required
 
 // ============================================================================
 // Session State
@@ -134,6 +137,20 @@ pub enum OutgoingMessage {
     Notification(JsonRpcNotification),
 }
 
+#[derive(Debug)]
+enum PromptError {
+    /// Authentication required - maps to RequestError.authRequired()
+    AuthRequired,
+    /// Internal error - maps to RequestError.internalError(undefined, message)
+    Internal { message: String },
+}
+
+#[derive(Debug)]
+enum PromptCompletion {
+    Stop(StopReason),
+    Error(PromptError),
+}
+
 // ============================================================================
 // WebSocket Handler
 // ============================================================================
@@ -156,18 +173,14 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
     let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(100);
 
     // Channel for signaling prompt completion (Result message received)
-    let prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<StopReason>>>> =
+    let prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<PromptCompletion>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
 
     // Task to send messages to WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let text = serde_json::to_string(&msg).unwrap();
-            if ws_sender
-                .send(Message::Text(text.into()))
-                .await
-                .is_err()
-            {
+            if ws_sender.send(Message::Text(text.into())).await.is_err() {
                 break;
             }
         }
@@ -204,13 +217,20 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
         // Parse into ClientRequest using AgentSide::decode_request
         let raw_params = request.params.to_string();
         let raw_value = RawValue::from_string(raw_params).ok();
-        let client_request = match AgentSide::decode_request(&request.method, raw_value.as_deref()) {
+        let client_request = match AgentSide::decode_request(&request.method, raw_value.as_deref())
+        {
             Ok(req) => req,
             Err(e) => {
-                let code = if e.message.contains("Method not found") { METHOD_NOT_FOUND } else { INVALID_REQUEST };
-                let _ = tx.send(OutgoingMessage::Response(
-                    JsonRpcResponse::error(request.id, code, e.message)
-                )).await;
+                let code = if e.message.contains("Method not found") {
+                    METHOD_NOT_FOUND
+                } else {
+                    INVALID_REQUEST
+                };
+                let _ = tx
+                    .send(OutgoingMessage::Response(JsonRpcResponse::error(
+                        request.id, code, e.message,
+                    )))
+                    .await;
                 continue;
             }
         };
@@ -218,7 +238,18 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
         // Route by ClientRequest variant
         match client_request {
             ClientRequest::NewSessionRequest(req) => {
-                let response = handle_session_new(request.id.clone(), req, &sessions, &mut current_session_id, &mut claude_stdin, &mut process_handle, &tx, &notification_id, &prompt_complete_tx).await;
+                let response = handle_session_new(
+                    request.id.clone(),
+                    req,
+                    &sessions,
+                    &mut current_session_id,
+                    &mut claude_stdin,
+                    &mut process_handle,
+                    &tx,
+                    &notification_id,
+                    &prompt_complete_tx,
+                )
+                .await;
                 if tx.send(OutgoingMessage::Response(response)).await.is_err() {
                     break;
                 }
@@ -232,26 +263,74 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
                 }
 
                 // Send prompt to Claude
-                if let Err(response) = send_prompt_to_claude(&req, &mut claude_stdin, &current_session_id).await {
-                    if tx.send(OutgoingMessage::Response(JsonRpcResponse::error(request.id.clone(), INTERNAL_ERROR, response))).await.is_err() {
+                if let Err(response) =
+                    send_prompt_to_claude(&req, &mut claude_stdin, &current_session_id).await
+                {
+                    if tx
+                        .send(OutgoingMessage::Response(JsonRpcResponse::error(
+                            request.id.clone(),
+                            INTERNAL_ERROR,
+                            response,
+                        )))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     continue;
                 }
 
                 // Wait for Claude to complete (Result message)
-                let stop_reason = match complete_rx.await {
-                    Ok(reason) => reason,
-                    Err(_) => StopReason::EndTurn, // Channel closed, assume end_turn
-                };
-
-                let response = PromptResponse::new(stop_reason);
-                if tx.send(OutgoingMessage::Response(JsonRpcResponse::success(request.id, response))).await.is_err() {
-                    break;
+                match complete_rx.await {
+                    Ok(PromptCompletion::Stop(stop_reason)) => {
+                        let response = PromptResponse::new(stop_reason);
+                        if tx
+                            .send(OutgoingMessage::Response(JsonRpcResponse::success(
+                                request.id, response,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(PromptCompletion::Error(err)) => {
+                        let (code, message) = match err {
+                            PromptError::AuthRequired => {
+                                (AUTH_REQUIRED, "Authentication required".to_string())
+                            }
+                            PromptError::Internal { message } => (INTERNAL_ERROR, message),
+                        };
+                        if tx
+                            .send(OutgoingMessage::Response(JsonRpcResponse::error(
+                                request.id, code, message,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let response = PromptResponse::new(StopReason::EndTurn);
+                        if tx
+                            .send(OutgoingMessage::Response(JsonRpcResponse::success(
+                                request.id, response,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
             _ => {
-                let response = JsonRpcResponse::error(request.id, METHOD_NOT_FOUND, format!("Method not implemented: {}", request.method));
+                let response = JsonRpcResponse::error(
+                    request.id,
+                    METHOD_NOT_FOUND,
+                    format!("Method not implemented: {}", request.method),
+                );
                 if tx.send(OutgoingMessage::Response(response)).await.is_err() {
                     break;
                 }
@@ -288,7 +367,7 @@ async fn handle_session_new(
     process_handle: &mut Option<ProcessHandle>,
     tx: &mpsc::Sender<OutgoingMessage>,
     notification_id: &Arc<AtomicI64>,
-    prompt_complete_tx: &Arc<tokio::sync::Mutex<Option<oneshot::Sender<StopReason>>>>,
+    prompt_complete_tx: &Arc<tokio::sync::Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
 ) -> JsonRpcResponse {
     let session_id = Uuid::new_v4().to_string();
 
@@ -313,13 +392,24 @@ async fn handle_session_new(
             let notification_id_clone = notification_id.clone();
             let prompt_complete_tx_clone = prompt_complete_tx.clone();
             tokio::spawn(async move {
-                forward_claude_output(stdout, tx_clone, session_id_clone, notification_id_clone, prompt_complete_tx_clone).await;
+                forward_claude_output(
+                    stdout,
+                    tx_clone,
+                    session_id_clone,
+                    notification_id_clone,
+                    prompt_complete_tx_clone,
+                )
+                .await;
             });
 
             tracing::info!("Claude process started for session {}", session_id);
         }
         Err(e) => {
-            return JsonRpcResponse::error(id.clone(), INTERNAL_ERROR, format!("Failed to start Claude: {}", e));
+            return JsonRpcResponse::error(
+                id.clone(),
+                INTERNAL_ERROR,
+                format!("Failed to start Claude: {}", e),
+            );
         }
     }
 
@@ -340,7 +430,10 @@ async fn send_prompt_to_claude(
         let input_msg = InputMessage::user(&content, session_id.clone());
         let json = serde_json::to_string(&input_msg).unwrap() + "\n";
 
-        stdin.write_all(json.as_bytes()).await.map_err(|e| format!("Failed to send to Claude: {}", e))?;
+        stdin
+            .write_all(json.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to send to Claude: {}", e))?;
         Ok(())
     } else {
         Err("No active session".to_string())
@@ -371,8 +464,9 @@ async fn start_claude_process(
         .await
         .map_err(|e| format!("Connect error: {}", e))?;
 
-    let (stdout, stdin, _stderr, handle) =
-        transport.split().map_err(|e| format!("Split error: {}", e))?;
+    let (stdout, stdin, _stderr, handle) = transport
+        .split()
+        .map_err(|e| format!("Split error: {}", e))?;
 
     Ok((stdout, stdin, handle))
 }
@@ -382,7 +476,7 @@ async fn forward_claude_output(
     tx: mpsc::Sender<OutgoingMessage>,
     session_id: String,
     _notification_id: Arc<AtomicI64>,
-    prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<StopReason>>>>,
+    prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
 ) {
     let mut reader = FramedRead::new(stdout, LinesCodec::new());
 
@@ -397,24 +491,17 @@ async fn forward_claude_output(
                 match serde_json::from_str::<ProtocolMessage>(&line) {
                     Ok(msg) => {
                         // Check if this is a Result message (turn complete)
-                        let stop_reason = extract_stop_reason(&msg);
-
-                        let notifications = protocol_message_to_notifications(&session_id, msg);
-                        for notification in notifications {
-                            let json_notification = JsonRpcNotification::new(
-                                "session/update",
-                                notification,
-                            );
-                            if tx.send(OutgoingMessage::Notification(json_notification)).await.is_err() {
+                        match handle_msg(tx.clone(), &session_id, prompt_complete_tx.clone(), msg)
+                            .await
+                        {
+                            Ok(Some(_)) => return,
+                            Ok(None) => {}
+                            Err(err) => {
+                                let mut guard = prompt_complete_tx.lock().await;
+                                if let Some(sender) = guard.take() {
+                                    let _ = sender.send(PromptCompletion::Error(err));
+                                }
                                 return;
-                            }
-                        }
-
-                        // If we got a Result message, signal completion
-                        if let Some(reason) = stop_reason {
-                            let mut guard = prompt_complete_tx.lock().await;
-                            if let Some(sender) = guard.take() {
-                                let _ = sender.send(reason);
                             }
                         }
                     }
@@ -432,7 +519,11 @@ async fn forward_claude_output(
                                     }
                                 }),
                             );
-                            if tx.send(OutgoingMessage::Notification(notification)).await.is_err() {
+                            if tx
+                                .send(OutgoingMessage::Notification(notification))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -449,184 +540,108 @@ async fn forward_claude_output(
     tracing::info!("Claude output stream ended for session {}", session_id);
 }
 
-/// Extract StopReason from Result message if present
-fn extract_stop_reason(msg: &ProtocolMessage) -> Option<StopReason> {
-    match msg {
-        ProtocolMessage::Result(result) => {
-            // Map result subtype to StopReason
-            let reason = match result.subtype.as_str() {
-                "success" => StopReason::EndTurn,
-                "error_max_turns" => StopReason::MaxTurnRequests,
-                "error_during_execution" if result.is_error => StopReason::EndTurn,
-                _ => StopReason::EndTurn,
-            };
-            Some(reason)
-        }
-        _ => None,
-    }
-}
+async fn handle_msg(
+    tx: mpsc::Sender<OutgoingMessage>,
+    session_id: &String,
+    _prompt_complete_tx: Arc<Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
+    msg: ProtocolMessage,
+) -> Result<Option<PromptResponse>, PromptError> {
+    match &msg {
+        ProtocolMessage::System(system_message) => match system_message.subtype.as_str() {
+            "init" => {
+                return Ok(None);
+            }
+            "compact_boundary" | "hook_started" | "task_notification" | "hook_progress"
+            | "hook_response" | "status" | "files_persisted" => {
+                return Ok(None);
+            }
+            _ => {
+                tracing::warn!("Unknown system message subtype: {:?}", system_message);
+                return Ok(None);
+            }
+        },
+        ProtocolMessage::Result(result_message) => {
+            let result_text = result_message.result.clone().unwrap_or_default();
+            let errors_text = result_message.errors.join(", ");
 
-// ============================================================================
-// Protocol Message to ACP Notification Conversion
-// ============================================================================
-
-/// Convert ProtocolMessage to JSON notifications following ACP SessionNotification format
-fn protocol_message_to_notifications(session_id: &str, msg: ProtocolMessage) -> Vec<serde_json::Value> {
-    let mut notifications = Vec::new();
-
-    println!("----------");
-    println!("{:#?}", msg);
-    println!("----------");
-    match msg {
-        ProtocolMessage::Assistant { message, .. } => {
-            // Process assistant message content blocks
-            for block in message.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        notifications.push(serde_json::json!({
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "agent_message_chunk",
-                                "content": {
-                                    "type": "text",
-                                    "text": text
-                                }
-                            }
-                        }));
+            match result_message.subtype.as_str() {
+                "success" => {
+                    if result_text.contains("Please run /login") {
+                        return Err(PromptError::AuthRequired);
                     }
-                    ContentBlock::Thinking { thinking, .. } => {
-                        notifications.push(serde_json::json!({
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "agent_thought_chunk",
-                                "content": {
-                                    "type": "text",
-                                    "text": thinking
-                                }
-                            }
-                        }));
+                    if result_message.is_error {
+                        return Err(PromptError::Internal { message: result_text });
                     }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        notifications.push(serde_json::json!({
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "tool_call",
-                                "toolCallId": id,
-                                "title": name,
-                                "status": "pending",
-                                "rawInput": input
-                            }
-                        }));
+                    return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
+                }
+                "error_during_execution" => {
+                    if result_message.is_error {
+                        let message = if errors_text.is_empty() { &result_message.subtype } else { &errors_text };
+                        return Err(PromptError::Internal { message: message.clone() });
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                        let status = if is_error.unwrap_or(false) { "failed" } else { "completed" };
-                        let raw_output = content.map(|c| match c {
-                            crate::claude::types::ContentBlockContent::String(s) => serde_json::Value::String(s),
-                            crate::claude::types::ContentBlockContent::Array(arr) => serde_json::Value::Array(arr),
-                        });
-                        notifications.push(serde_json::json!({
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "tool_call_update",
-                                "toolCallId": tool_use_id,
-                                "status": status,
-                                "rawOutput": raw_output
-                            }
-                        }));
+                    return Ok(Some(PromptResponse::new(StopReason::EndTurn)));
+                }
+                "error_max_budget_usd" | "error_max_turns" | "error_max_structured_output_retries" => {
+                    if result_message.is_error {
+                        let message = if errors_text.is_empty() { &result_message.subtype } else { &errors_text };
+                        return Err(PromptError::Internal { message: message.clone() });
                     }
+                    return Ok(Some(PromptResponse::new(StopReason::MaxTurnRequests)));
+                }
+                _ => {
+                    tracing::warn!("Unknown result subtype: {}", result_message.subtype);
+                    return Ok(None);
                 }
             }
         }
-        ProtocolMessage::Stream(stream_event) => {
-            // Handle stream events (partial updates)
-            if let Some(event) = stream_event.event.as_object() {
-                if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
-                    match event_type {
-                        "content_block_start" | "content_block_delta" => {
-                            // Extract content from the event
-                            let content_block = event.get("content_block").or_else(|| event.get("delta"));
-                            if let Some(block) = content_block {
-                                if let Some(block_type) = block.get("type").and_then(|v| v.as_str()) {
-                                    match block_type {
-                                        "text" | "text_delta" => {
-                                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                                notifications.push(serde_json::json!({
-                                                    "sessionId": session_id,
-                                                    "update": {
-                                                        "sessionUpdate": "agent_message_chunk",
-                                                        "content": {
-                                                            "type": "text",
-                                                            "text": text
-                                                        }
-                                                    }
-                                                }));
-                                            }
-                                        }
-                                        "thinking" | "thinking_delta" => {
-                                            if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
-                                                notifications.push(serde_json::json!({
-                                                    "sessionId": session_id,
-                                                    "update": {
-                                                        "sessionUpdate": "agent_thought_chunk",
-                                                        "content": {
-                                                            "type": "text",
-                                                            "text": thinking
-                                                        }
-                                                    }
-                                                }));
-                                            }
-                                        }
-                                        "tool_use" => {
-                                            if let (Some(id), Some(name)) = (
-                                                block.get("id").and_then(|v| v.as_str()),
-                                                block.get("name").and_then(|v| v.as_str()),
-                                            ) {
-                                                let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
-                                                notifications.push(serde_json::json!({
-                                                    "sessionId": session_id,
-                                                    "update": {
-                                                        "sessionUpdate": "tool_call",
-                                                        "toolCallId": id,
-                                                        "title": name,
-                                                        "status": "pending",
-                                                        "rawInput": input
-                                                    }
-                                                }));
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+        ProtocolMessage::Stream(msg) => {
+            // Stream events - convert to notifications and send
+            // let notifications = protocol_message_to_notifications(session_id, msg);
+            // for notification in notifications {
+            //     let json_notification = JsonRpcNotification::new("session/update", notification);
+            //     if tx
+            //         .send(OutgoingMessage::Notification(json_notification))
+            //         .await
+            //         .is_err()
+            //     {
+            //         tracing::warn!("Failed to send stream notification");
+            //     }
+            // }
+            // return Ok(None);
+            todo!()
+        }
+        ProtocolMessage::Assistant { .. } => {
+            // Assistant messages - convert to notifications and send
+            let notifications = protocol_message_to_notifications(session_id, msg);
+            for notification in notifications {
+                let json_notification = JsonRpcNotification::new("session/update", notification);
+                if tx
+                    .send(OutgoingMessage::Notification(json_notification))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Failed to send assistant notification");
                 }
             }
-        }
-        ProtocolMessage::Result(result) => {
-            // Result messages indicate end of turn - we don't need to send notifications for these
-            // The PromptResponse will be sent separately
-            tracing::debug!("Result message: subtype={}, is_error={}", result.subtype, result.is_error);
-        }
-        ProtocolMessage::System(system) => {
-            // System messages are mostly internal - log them but don't forward
-            tracing::debug!("System message: subtype={}", system.subtype);
+            return Ok(None);
         }
         ProtocolMessage::User { .. } => {
             // User messages are echoes of input - typically don't need to forward
+            return Ok(None);
         }
         ProtocolMessage::ControlRequest { .. } | ProtocolMessage::ControlResponse { .. } => {
             // Control messages are internal protocol - don't forward
+            return Ok(None);
         }
     }
-
-    notifications
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
+
+
+fn to_acp_notifications()->Vec<SessionNotification>{
+    todo!()
+}
+
 
 fn prompt_to_string(blocks: &[AcpContentBlock]) -> String {
     blocks
@@ -637,4 +652,56 @@ fn prompt_to_string(blocks: &[AcpContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_result_message(is_error: bool, result: Option<String>) -> ProtocolMessage {
+        ProtocolMessage::Result(crate::claude::types::ResultMessage {
+            subtype: "success".to_string(),
+            duration_ms: 0,
+            duration_api_ms: 0,
+            is_error,
+            num_turns: 0,
+            session_id: "session".to_string(),
+            total_cost_usd: None,
+            usage: None,
+            result,
+            structured_output: None,
+            errors: Vec::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn handle_msg_returns_error_on_login_required() {
+        let (tx, _rx) = mpsc::channel::<OutgoingMessage>(1);
+        let session_id = "session".to_string();
+        let (complete_tx, _complete_rx) = oneshot::channel();
+        let prompt_complete_tx = Arc::new(Mutex::new(Some(complete_tx)));
+        let msg = build_result_message(false, Some("Please run /login".to_string()));
+
+        let result = handle_msg(tx, &session_id, prompt_complete_tx, msg).await;
+        let err = result.expect_err("expected auth error");
+        assert!(matches!(err, PromptError::AuthRequired));
+    }
+
+    #[tokio::test]
+    async fn handle_msg_returns_error_on_error_result() {
+        let (tx, _rx) = mpsc::channel::<OutgoingMessage>(1);
+        let session_id = "session".to_string();
+        let (complete_tx, _complete_rx) = oneshot::channel();
+        let prompt_complete_tx = Arc::new(Mutex::new(Some(complete_tx)));
+        let msg = build_result_message(true, Some("backend error".to_string()));
+
+        let result = handle_msg(tx, &session_id, prompt_complete_tx, msg).await;
+        let err = result.expect_err("expected error result");
+        match err {
+            PromptError::Internal { message } => {
+                assert_eq!(message, "backend error");
+            }
+            _ => panic!("expected Internal error"),
+        }
+    }
 }
