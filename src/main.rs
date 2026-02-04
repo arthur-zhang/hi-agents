@@ -1,14 +1,22 @@
 mod ws;
 
-use agent_client_protocol::{NewSessionResponse, RequestPermissionRequest, SessionUpdate};
-use uuid::uuid;
+use axum::{routing::get, Router};
+use dashmap::DashMap;
+use std::sync::Arc;
 
-fn main() {
-    println!("Hello, world!");
-    let a = agent_client_protocol::NewSessionRequest::new("/tmp");
-    let id = uuid::Uuid::new_v4().to_string();
-    let b : NewSessionResponse = NewSessionResponse::new(id);
-    println!("{:#?}", a);
-    println!("{:#?}", b);
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
 
+    let sessions = Arc::new(DashMap::new());
+
+    let app = Router::new()
+        .route("/ws", get(ws::ws_handler))
+        .with_state(sessions);
+
+    let addr = "0.0.0.0:3000";
+    tracing::info!("WebSocket server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
