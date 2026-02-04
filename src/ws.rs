@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use uuid::Uuid;
 
@@ -155,6 +155,10 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
     // Channel for sending messages to WebSocket
     let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(100);
 
+    // Channel for signaling prompt completion (Result message received)
+    let prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<StopReason>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
     // Task to send messages to WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -212,20 +216,46 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
         };
 
         // Route by ClientRequest variant
-        let response = match client_request {
+        match client_request {
             ClientRequest::NewSessionRequest(req) => {
-                handle_session_new(request.id.clone(), req, &sessions, &mut current_session_id, &mut claude_stdin, &mut process_handle, &tx, &notification_id).await
+                let response = handle_session_new(request.id.clone(), req, &sessions, &mut current_session_id, &mut claude_stdin, &mut process_handle, &tx, &notification_id, &prompt_complete_tx).await;
+                if tx.send(OutgoingMessage::Response(response)).await.is_err() {
+                    break;
+                }
             }
             ClientRequest::PromptRequest(req) => {
-                handle_session_prompt(request.id.clone(), req, &mut claude_stdin, &current_session_id).await
+                // Create a oneshot channel to wait for completion
+                let (complete_tx, complete_rx) = oneshot::channel();
+                {
+                    let mut guard = prompt_complete_tx.lock().await;
+                    *guard = Some(complete_tx);
+                }
+
+                // Send prompt to Claude
+                if let Err(response) = send_prompt_to_claude(&req, &mut claude_stdin, &current_session_id).await {
+                    if tx.send(OutgoingMessage::Response(JsonRpcResponse::error(request.id.clone(), INTERNAL_ERROR, response))).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Wait for Claude to complete (Result message)
+                let stop_reason = match complete_rx.await {
+                    Ok(reason) => reason,
+                    Err(_) => StopReason::EndTurn, // Channel closed, assume end_turn
+                };
+
+                let response = PromptResponse::new(stop_reason);
+                if tx.send(OutgoingMessage::Response(JsonRpcResponse::success(request.id, response))).await.is_err() {
+                    break;
+                }
             }
             _ => {
-                JsonRpcResponse::error(request.id, METHOD_NOT_FOUND, format!("Method not implemented: {}", request.method))
+                let response = JsonRpcResponse::error(request.id, METHOD_NOT_FOUND, format!("Method not implemented: {}", request.method));
+                if tx.send(OutgoingMessage::Response(response)).await.is_err() {
+                    break;
+                }
             }
-        };
-
-        if tx.send(OutgoingMessage::Response(response)).await.is_err() {
-            break;
         }
     }
 
@@ -258,6 +288,7 @@ async fn handle_session_new(
     process_handle: &mut Option<ProcessHandle>,
     tx: &mpsc::Sender<OutgoingMessage>,
     notification_id: &Arc<AtomicI64>,
+    prompt_complete_tx: &Arc<tokio::sync::Mutex<Option<oneshot::Sender<StopReason>>>>,
 ) -> JsonRpcResponse {
     let session_id = Uuid::new_v4().to_string();
 
@@ -280,8 +311,9 @@ async fn handle_session_new(
             let tx_clone = tx.clone();
             let session_id_clone = session_id.clone();
             let notification_id_clone = notification_id.clone();
+            let prompt_complete_tx_clone = prompt_complete_tx.clone();
             tokio::spawn(async move {
-                forward_claude_output(stdout, tx_clone, session_id_clone, notification_id_clone).await;
+                forward_claude_output(stdout, tx_clone, session_id_clone, notification_id_clone, prompt_complete_tx_clone).await;
             });
 
             tracing::info!("Claude process started for session {}", session_id);
@@ -296,27 +328,22 @@ async fn handle_session_new(
     JsonRpcResponse::success(id, response)
 }
 
-async fn handle_session_prompt(
-    id: RequestId,
-    req: PromptRequest,
+/// Send prompt to Claude stdin. Returns Ok(()) on success, Err(message) on failure.
+async fn send_prompt_to_claude(
+    req: &PromptRequest,
     claude_stdin: &mut Option<ChildStdin>,
     current_session_id: &Option<String>,
-) -> JsonRpcResponse {
+) -> Result<(), String> {
     if let (Some(stdin), Some(session_id)) = (claude_stdin, current_session_id) {
         // Convert ContentBlocks to string for Claude input
         let content = prompt_to_string(&req.prompt);
         let input_msg = InputMessage::user(&content, session_id.clone());
         let json = serde_json::to_string(&input_msg).unwrap() + "\n";
 
-        if let Err(e) = stdin.write_all(json.as_bytes()).await {
-            return JsonRpcResponse::error(id.clone(), INTERNAL_ERROR, format!("Failed to send to Claude: {}", e));
-        }
-
-        // Return PromptResponse (actual response will come via notifications)
-        let response = PromptResponse::new(StopReason::EndTurn);
-        JsonRpcResponse::success(id, response)
+        stdin.write_all(json.as_bytes()).await.map_err(|e| format!("Failed to send to Claude: {}", e))?;
+        Ok(())
     } else {
-        JsonRpcResponse::error(id, INVALID_REQUEST, "No active session")
+        Err("No active session".to_string())
     }
 }
 
@@ -355,6 +382,7 @@ async fn forward_claude_output(
     tx: mpsc::Sender<OutgoingMessage>,
     session_id: String,
     _notification_id: Arc<AtomicI64>,
+    prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<StopReason>>>>,
 ) {
     let mut reader = FramedRead::new(stdout, LinesCodec::new());
 
@@ -368,6 +396,9 @@ async fn forward_claude_output(
                 // Parse as ProtocolMessage and convert to SessionNotification
                 match serde_json::from_str::<ProtocolMessage>(&line) {
                     Ok(msg) => {
+                        // Check if this is a Result message (turn complete)
+                        let stop_reason = extract_stop_reason(&msg);
+
                         let notifications = protocol_message_to_notifications(&session_id, msg);
                         for notification in notifications {
                             let json_notification = JsonRpcNotification::new(
@@ -376,6 +407,14 @@ async fn forward_claude_output(
                             );
                             if tx.send(OutgoingMessage::Notification(json_notification)).await.is_err() {
                                 return;
+                            }
+                        }
+
+                        // If we got a Result message, signal completion
+                        if let Some(reason) = stop_reason {
+                            let mut guard = prompt_complete_tx.lock().await;
+                            if let Some(sender) = guard.take() {
+                                let _ = sender.send(reason);
                             }
                         }
                     }
@@ -408,6 +447,23 @@ async fn forward_claude_output(
     }
 
     tracing::info!("Claude output stream ended for session {}", session_id);
+}
+
+/// Extract StopReason from Result message if present
+fn extract_stop_reason(msg: &ProtocolMessage) -> Option<StopReason> {
+    match msg {
+        ProtocolMessage::Result(result) => {
+            // Map result subtype to StopReason
+            let reason = match result.subtype.as_str() {
+                "success" => StopReason::EndTurn,
+                "error_max_turns" => StopReason::MaxTurnRequests,
+                "error_during_execution" if result.is_error => StopReason::EndTurn,
+                _ => StopReason::EndTurn,
+            };
+            Some(reason)
+        }
+        _ => None,
+    }
 }
 
 // ============================================================================
