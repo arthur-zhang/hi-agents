@@ -17,19 +17,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicI64;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::claude::process_handle::ProcessHandle;
 use crate::claude::transport::transport2::SubprocessCLITransport;
 use crate::claude::types::{
     ClaudeAgentOptions, ContentBlock, ContentBlockContent, ImageSource, InputMessage,
     ProtocolMessage,
 };
+use crate::claude::{process_handle::ProcessHandle, transport::stream::into_event_stream};
 
 // ============================================================================
 // JSON-RPC Types
@@ -167,19 +165,109 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, sessions))
 }
 
+/// Result of a single Turn execution
+struct TurnResult {
+    /// The stdout returned for reuse in the next turn
+    stdout: ChildStdout,
+    /// How the turn completed
+    completion: PromptCompletion,
+    /// Updated tool use cache
+    tool_use_cache: ToolUseCache,
+}
+
+/// Execute a single turn: send prompt, process output until Result message
+async fn execute_turn(
+    req: &PromptRequest,
+    stdin: &mut ChildStdin,
+    stdout: ChildStdout,
+    session_id: &str,
+    tx: &mpsc::Sender<OutgoingMessage>,
+    mut tool_use_cache: ToolUseCache,
+) -> TurnResult {
+    // Send prompt to Claude stdin
+    let content = prompt_to_string(&req.prompt);
+    let input_msg = InputMessage::user(&content, session_id.to_string());
+    let json = serde_json::to_string(&input_msg).unwrap() + "\n";
+
+    if let Err(e) = stdin.write_all(json.as_bytes()).await {
+        return TurnResult {
+            stdout,
+            completion: PromptCompletion::Error(PromptError::Internal {
+                message: format!("Failed to send to Claude: {}", e),
+            }),
+            tool_use_cache,
+        };
+    }
+
+    // Process stdout until we get a Result message
+    let mut stream = into_event_stream(stdout);
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(msg) => {
+                match handle_msg(tx.clone(), &session_id.to_string(), &msg, &mut tool_use_cache)
+                    .await
+                {
+                    Ok(Some(prompt_response)) => {
+                        println!(
+                            "prompt_response: {}",
+                            serde_json::to_string(&prompt_response).unwrap()
+                        );
+                        // Turn complete - return stdout for reuse
+                        let stdout = stream.into_inner();
+                        return TurnResult {
+                            stdout,
+                            completion: PromptCompletion::Stop(prompt_response.stop_reason),
+                            tool_use_cache,
+                        };
+                    }
+                    Ok(None) => {
+                        // Continue processing
+                    }
+                    Err(err) => {
+                        let stdout = stream.into_inner();
+                        return TurnResult {
+                            stdout,
+                            completion: PromptCompletion::Error(err),
+                            tool_use_cache,
+                        };
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Error reading Claude output: {}", e);
+                let stdout = stream.into_inner();
+                return TurnResult {
+                    stdout,
+                    completion: PromptCompletion::Error(PromptError::Internal {
+                        message: format!("Error reading Claude output: {}", e),
+                    }),
+                    tool_use_cache,
+                };
+            }
+        }
+    }
+
+    // Stream ended unexpectedly
+    tracing::warn!("Claude output stream ended unexpectedly for session {}", session_id);
+    let stdout = stream.into_inner();
+    TurnResult {
+        stdout,
+        completion: PromptCompletion::Stop(StopReason::EndTurn),
+        tool_use_cache,
+    }
+}
+
 async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut current_session_id: Option<String> = None;
     let mut claude_stdin: Option<ChildStdin> = None;
+    let mut claude_stdout: Option<ChildStdout> = None;
     let mut process_handle: Option<ProcessHandle> = None;
-    let notification_id = Arc::new(AtomicI64::new(0));
+    let mut tool_use_cache: ToolUseCache = ToolUseCache::new();
 
     // Channel for sending messages to WebSocket
     let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(100);
-
-    // Channel for signaling prompt completion (Result message received)
-    let prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<PromptCompletion>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
 
     // Task to send messages to WebSocket
     let send_task = tokio::spawn(async move {
@@ -193,6 +281,7 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
 
     // Main message loop
     while let Some(msg) = ws_receiver.next().await {
+        println!("received message: {:?}", msg);
         let msg = match msg {
             Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) => break,
@@ -249,10 +338,8 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
                     &sessions,
                     &mut current_session_id,
                     &mut claude_stdin,
+                    &mut claude_stdout,
                     &mut process_handle,
-                    &tx,
-                    &notification_id,
-                    &prompt_complete_tx,
                 )
                 .await;
                 if tx.send(OutgoingMessage::Response(response)).await.is_err() {
@@ -260,74 +347,51 @@ async fn handle_socket(socket: WebSocket, sessions: SessionManager) {
                 }
             }
             ClientRequest::PromptRequest(req) => {
-                // Create a oneshot channel to wait for completion
-                let (complete_tx, complete_rx) = oneshot::channel();
-                {
-                    let mut guard = prompt_complete_tx.lock().await;
-                    *guard = Some(complete_tx);
-                }
-
-                // Send prompt to Claude
-                if let Err(response) =
-                    send_prompt_to_claude(&req, &mut claude_stdin, &current_session_id).await
-                {
-                    if tx
+                // Check if we have an active session
+                let (Some(stdin), Some(stdout), Some(session_id)) =
+                    (claude_stdin.as_mut(), claude_stdout.take(), &current_session_id)
+                else {
+                    let _ = tx
                         .send(OutgoingMessage::Response(JsonRpcResponse::error(
-                            request.id.clone(),
+                            request.id,
                             INTERNAL_ERROR,
-                            response,
+                            "No active session",
                         )))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                        .await;
                     continue;
-                }
+                };
 
-                // Wait for Claude to complete (Result message)
-                match complete_rx.await {
-                    Ok(PromptCompletion::Stop(stop_reason)) => {
-                        let response = PromptResponse::new(stop_reason);
-                        if tx
-                            .send(OutgoingMessage::Response(JsonRpcResponse::success(
-                                request.id, response,
-                            )))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                println!("sending prompt to claude");
+
+                // Execute the turn - stdout ownership transfers in and out
+                let turn_result =
+                    execute_turn(&req, stdin, stdout, session_id, &tx, tool_use_cache).await;
+
+                // Restore stdout for next turn
+                claude_stdout = Some(turn_result.stdout);
+                tool_use_cache = turn_result.tool_use_cache;
+
+                println!("end of sending prompt to claude");
+
+                // Handle completion
+                let response = match turn_result.completion {
+                    PromptCompletion::Stop(stop_reason) => {
+                        println!("prompt completed: {:?}", stop_reason);
+                        JsonRpcResponse::success(request.id, PromptResponse::new(stop_reason))
                     }
-                    Ok(PromptCompletion::Error(err)) => {
+                    PromptCompletion::Error(err) => {
                         let (code, message) = match err {
                             PromptError::AuthRequired => {
                                 (AUTH_REQUIRED, "Authentication required".to_string())
                             }
                             PromptError::Internal { message } => (INTERNAL_ERROR, message),
                         };
-                        if tx
-                            .send(OutgoingMessage::Response(JsonRpcResponse::error(
-                                request.id, code, message,
-                            )))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                        JsonRpcResponse::error(request.id, code, message)
                     }
-                    Err(_) => {
-                        let response = PromptResponse::new(StopReason::EndTurn);
-                        if tx
-                            .send(OutgoingMessage::Response(JsonRpcResponse::success(
-                                request.id, response,
-                            )))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
+                };
+
+                if tx.send(OutgoingMessage::Response(response)).await.is_err() {
+                    break;
                 }
             }
             _ => {
@@ -369,10 +433,8 @@ async fn handle_session_new(
     sessions: &SessionManager,
     current_session_id: &mut Option<String>,
     claude_stdin: &mut Option<ChildStdin>,
+    claude_stdout: &mut Option<ChildStdout>,
     process_handle: &mut Option<ProcessHandle>,
-    tx: &mpsc::Sender<OutgoingMessage>,
-    notification_id: &Arc<AtomicI64>,
-    prompt_complete_tx: &Arc<tokio::sync::Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
 ) -> JsonRpcResponse {
     let session_id = Uuid::new_v4().to_string();
 
@@ -389,23 +451,8 @@ async fn handle_session_new(
     match start_claude_process(&req, &session_id).await {
         Ok((stdout, stdin, handle)) => {
             *claude_stdin = Some(stdin);
+            *claude_stdout = Some(stdout);
             *process_handle = Some(handle);
-
-            // Spawn task to read Claude stdout and forward as notifications
-            let tx_clone = tx.clone();
-            let session_id_clone = session_id.clone();
-            let notification_id_clone = notification_id.clone();
-            let prompt_complete_tx_clone = prompt_complete_tx.clone();
-            tokio::spawn(async move {
-                forward_claude_output(
-                    stdout,
-                    tx_clone,
-                    session_id_clone,
-                    notification_id_clone,
-                    prompt_complete_tx_clone,
-                )
-                .await;
-            });
 
             tracing::info!("Claude process started for session {}", session_id);
         }
@@ -423,28 +470,6 @@ async fn handle_session_new(
     JsonRpcResponse::success(id, response)
 }
 
-/// Send prompt to Claude stdin. Returns Ok(()) on success, Err(message) on failure.
-async fn send_prompt_to_claude(
-    req: &PromptRequest,
-    claude_stdin: &mut Option<ChildStdin>,
-    current_session_id: &Option<String>,
-) -> Result<(), String> {
-    if let (Some(stdin), Some(session_id)) = (claude_stdin, current_session_id) {
-        // Convert ContentBlocks to string for Claude input
-        let content = prompt_to_string(&req.prompt);
-        let input_msg = InputMessage::user(&content, session_id.clone());
-        let json = serde_json::to_string(&input_msg).unwrap() + "\n";
-
-        stdin
-            .write_all(json.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to send to Claude: {}", e))?;
-        Ok(())
-    } else {
-        Err("No active session".to_string())
-    }
-}
-
 // ============================================================================
 // Claude Process Management
 // ============================================================================
@@ -456,6 +481,7 @@ async fn start_claude_process(
     let mut options = ClaudeAgentOptions::new();
     options.cwd = Some(req.cwd.clone());
     options.max_thinking_tokens = Some(50000);
+    options.include_partial_messages = true;
 
     // Add session ID to extra args
     options
@@ -477,88 +503,10 @@ async fn start_claude_process(
     Ok((stdout, stdin, handle))
 }
 
-async fn forward_claude_output(
-    stdout: ChildStdout,
-    tx: mpsc::Sender<OutgoingMessage>,
-    session_id: String,
-    _notification_id: Arc<AtomicI64>,
-    prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
-) {
-    let mut reader = FramedRead::new(stdout, LinesCodec::new());
-    // Session-level tool use cache - persists across all messages in this session
-    let mut tool_use_cache = ToolUseCache::new();
-
-    while let Some(result) = reader.next().await {
-        match result {
-            Ok(line) => {
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Parse as ProtocolMessage and convert to SessionNotification
-                match serde_json::from_str::<ProtocolMessage>(&line) {
-                    Ok(msg) => {
-                        // Check if this is a Result message (turn complete)
-                        match handle_msg(
-                            tx.clone(),
-                            &session_id,
-                            prompt_complete_tx.clone(),
-                            msg,
-                            &mut tool_use_cache,
-                        )
-                        .await
-                        {
-                            Ok(Some(_)) => return,
-                            Ok(None) => {}
-                            Err(err) => {
-                                let mut guard = prompt_complete_tx.lock().await;
-                                if let Some(sender) = guard.take() {
-                                    let _ = sender.send(PromptCompletion::Error(err));
-                                }
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse ProtocolMessage: {} - line: {}", e, &line);
-                        // Fallback: send raw data
-                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&line) {
-                            let notification = JsonRpcNotification::new(
-                                "session/update",
-                                serde_json::json!({
-                                    "sessionId": session_id,
-                                    "update": {
-                                        "sessionUpdate": "raw",
-                                        "data": data
-                                    }
-                                }),
-                            );
-                            if tx
-                                .send(OutgoingMessage::Notification(notification))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Error reading Claude output: {}", e);
-                break;
-            }
-        }
-    }
-
-    tracing::info!("Claude output stream ended for session {}", session_id);
-}
-
 async fn handle_msg(
     tx: mpsc::Sender<OutgoingMessage>,
     session_id: &String,
-    _prompt_complete_tx: Arc<Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
-    msg: ProtocolMessage,
+    msg: &ProtocolMessage,
     tool_use_cache: &mut ToolUseCache,
 ) -> Result<Option<PromptResponse>, PromptError> {
     println!("===========");
@@ -630,11 +578,8 @@ async fn handle_msg(
         }
         ProtocolMessage::Stream(stream_event) => {
             // Stream events - convert to notifications and send
-            let notifications = stream_event_to_acp_notifications(
-                stream_event,
-                session_id,
-                tool_use_cache,
-            );
+            let notifications =
+                stream_event_to_acp_notifications(stream_event, session_id, tool_use_cache);
 
             for notification in notifications {
                 let json_notification = JsonRpcNotification::new("session/update", notification);
@@ -1023,22 +968,18 @@ pub fn stream_event_to_acp_notifications(
     let event_type: Result<StreamEventType, _> = serde_json::from_value(stream_event.event.clone());
 
     match event_type {
-        Ok(StreamEventType::ContentBlockStart { content_block }) => {
-            to_acp_notifications(
-                AcpContent::Blocks(vec![content_block]),
-                MessageRole::Assistant,
-                session_id,
-                tool_use_cache,
-            )
-        }
-        Ok(StreamEventType::ContentBlockDelta { delta }) => {
-            to_acp_notifications(
-                AcpContent::Blocks(vec![delta]),
-                MessageRole::Assistant,
-                session_id,
-                tool_use_cache,
-            )
-        }
+        Ok(StreamEventType::ContentBlockStart { content_block }) => to_acp_notifications(
+            AcpContent::Blocks(vec![content_block]),
+            MessageRole::Assistant,
+            session_id,
+            tool_use_cache,
+        ),
+        Ok(StreamEventType::ContentBlockDelta { delta }) => to_acp_notifications(
+            AcpContent::Blocks(vec![delta]),
+            MessageRole::Assistant,
+            session_id,
+            tool_use_cache,
+        ),
         // No content for these events
         Ok(StreamEventType::MessageStart)
         | Ok(StreamEventType::MessageDelta)
