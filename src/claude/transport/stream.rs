@@ -1,7 +1,9 @@
 use crate::claude::Error;
 use crate::claude::types::ProtocolMessage;
 use futures::{Stream, StreamExt};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
@@ -44,13 +46,40 @@ impl ReadHalf {
     }
 }
 
-pub fn into_event_stream(
-    stdout: ChildStdout,
-) -> impl Stream<Item = Result<ProtocolMessage, Error>> {
-    let stream = FramedRead::new(stdout, LinesCodec::new());
-    stream.map(|it| {
-        it.map_err(Error::from).and_then(|line| {
-            serde_json::from_str::<ProtocolMessage>(&line).map_err(Error::from)
-        })
-    })
+/// A stream wrapper that allows recovering the inner ChildStdout
+pub struct EventStream {
+    inner: FramedRead<ChildStdout, LinesCodec>,
+}
+
+impl EventStream {
+    pub fn new(stdout: ChildStdout) -> Self {
+        Self {
+            inner: FramedRead::new(stdout, LinesCodec::new()),
+        }
+    }
+
+    /// Consume the stream and return the inner ChildStdout
+    pub fn into_inner(self) -> ChildStdout {
+        self.inner.into_inner()
+    }
+}
+
+impl Stream for EventStream {
+    type Item = Result<ProtocolMessage, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(line))) => {
+                let result = serde_json::from_str::<ProtocolMessage>(&line).map_err(Error::from);
+                Poll::Ready(Some(result))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Error::from(e)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub fn into_event_stream(stdout: ChildStdout) -> EventStream {
+    EventStream::new(stdout)
 }

@@ -1,4 +1,4 @@
-import { useState, KeyboardEvent } from 'react'
+import { useState, useEffect, useRef, KeyboardEvent } from 'react'
 import * as ScrollArea from '@radix-ui/react-scroll-area'
 import * as Separator from '@radix-ui/react-separator'
 import type { ConnectionStatus, ChatMessage } from '../types'
@@ -23,6 +23,14 @@ export function ChatPanel({
   onSendPrompt,
 }: ChatPanelProps) {
   const [input, setInput] = useState('')
+  const viewportRef = useRef<HTMLDivElement>(null)
+
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    if (viewportRef.current) {
+      viewportRef.current.scrollTop = viewportRef.current.scrollHeight
+    }
+  }, [messages])
 
   const handleSend = () => {
     if (!input.trim() || !sessionId) return
@@ -89,7 +97,7 @@ export function ChatPanel({
 
       {/* Messages */}
       <ScrollArea.Root className="flex-1 overflow-hidden">
-        <ScrollArea.Viewport className="h-full w-full p-4">
+        <ScrollArea.Viewport ref={viewportRef} className="h-full w-full p-4">
           <div className="space-y-3">
             {messages.map((msg) => (
               <div
