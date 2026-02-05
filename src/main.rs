@@ -1,3 +1,4 @@
+mod agent;
 mod claude;
 mod codex;
 mod ws;
