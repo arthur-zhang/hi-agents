@@ -485,6 +485,8 @@ async fn forward_claude_output(
     prompt_complete_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
 ) {
     let mut reader = FramedRead::new(stdout, LinesCodec::new());
+    // Session-level tool use cache - persists across all messages in this session
+    let mut tool_use_cache = ToolUseCache::new();
 
     while let Some(result) = reader.next().await {
         match result {
@@ -497,8 +499,14 @@ async fn forward_claude_output(
                 match serde_json::from_str::<ProtocolMessage>(&line) {
                     Ok(msg) => {
                         // Check if this is a Result message (turn complete)
-                        match handle_msg(tx.clone(), &session_id, prompt_complete_tx.clone(), msg)
-                            .await
+                        match handle_msg(
+                            tx.clone(),
+                            &session_id,
+                            prompt_complete_tx.clone(),
+                            msg,
+                            &mut tool_use_cache,
+                        )
+                        .await
                         {
                             Ok(Some(_)) => return,
                             Ok(None) => {}
@@ -551,6 +559,7 @@ async fn handle_msg(
     session_id: &String,
     _prompt_complete_tx: Arc<Mutex<Option<oneshot::Sender<PromptCompletion>>>>,
     msg: ProtocolMessage,
+    tool_use_cache: &mut ToolUseCache,
 ) -> Result<Option<PromptResponse>, PromptError> {
     println!("===========");
     println!("handle_msg: {:?}", serde_json::to_string(&msg).unwrap());
@@ -621,11 +630,10 @@ async fn handle_msg(
         }
         ProtocolMessage::Stream(stream_event) => {
             // Stream events - convert to notifications and send
-            let mut tool_use_cache = ToolUseCache::new();
             let notifications = stream_event_to_acp_notifications(
                 stream_event,
                 session_id,
-                &mut tool_use_cache,
+                tool_use_cache,
             );
 
             for notification in notifications {
@@ -660,12 +668,11 @@ async fn handle_msg(
                 })
                 .collect();
 
-            let mut tool_use_cache = ToolUseCache::new();
             let notifications = to_acp_notifications(
                 AcpContent::Blocks(filtered_content),
                 MessageRole::Assistant,
                 session_id,
-                &mut tool_use_cache,
+                tool_use_cache,
             );
 
             for notification in notifications {
@@ -695,12 +702,11 @@ async fn handle_msg(
                         let cleaned = content
                             .replace("<local-command-stdout>", "")
                             .replace("</local-command-stdout>", "");
-                        let mut tool_use_cache = ToolUseCache::new();
                         let notifications = to_acp_notifications(
                             AcpContent::String(cleaned),
                             MessageRole::Assistant,
                             session_id,
-                            &mut tool_use_cache,
+                            tool_use_cache,
                         );
                         for notification in notifications {
                             let json_notification =
@@ -746,9 +752,8 @@ async fn handle_msg(
                 }
             };
 
-            let mut tool_use_cache = ToolUseCache::new();
             let notifications =
-                to_acp_notifications(content, MessageRole::User, session_id, &mut tool_use_cache);
+                to_acp_notifications(content, MessageRole::User, session_id, tool_use_cache);
 
             for notification in notifications {
                 let json_notification = JsonRpcNotification::new("session/update", notification);
@@ -1044,54 +1049,6 @@ pub fn stream_event_to_acp_notifications(
             tracing::warn!("Failed to parse stream event: {}", e);
             Vec::new()
         }
-    }
-}
-
-/// Convert a ProtocolMessage to ACP SessionNotifications
-fn protocol_message_to_notifications(
-    session_id: &str,
-    msg: ProtocolMessage,
-) -> Vec<SessionNotification> {
-    // Create a temporary tool use cache for this conversion
-    // In a real implementation, this should be passed in and maintained across calls
-    let mut tool_use_cache = ToolUseCache::new();
-
-    match msg {
-        ProtocolMessage::Assistant { message, .. } => {
-            // Filter out text and thinking blocks (handled by stream events)
-            let filtered_content: Vec<ContentBlock> = message
-                .content
-                .into_iter()
-                .filter(|block| {
-                    !matches!(
-                        block,
-                        ContentBlock::Text { .. } | ContentBlock::Thinking { .. }
-                    )
-                })
-                .collect();
-
-            to_acp_notifications(
-                AcpContent::Blocks(filtered_content),
-                MessageRole::Assistant,
-                session_id,
-                &mut tool_use_cache,
-            )
-        }
-        ProtocolMessage::User { message, .. } => match message.content {
-            crate::claude::types::MessageContent::String(s) => to_acp_notifications(
-                AcpContent::String(s),
-                MessageRole::User,
-                session_id,
-                &mut tool_use_cache,
-            ),
-            crate::claude::types::MessageContent::Blocks(blocks) => to_acp_notifications(
-                AcpContent::Blocks(blocks),
-                MessageRole::User,
-                session_id,
-                &mut tool_use_cache,
-            ),
-        },
-        _ => Vec::new(),
     }
 }
 
