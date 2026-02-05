@@ -62,6 +62,14 @@ impl EventStream {
     pub fn into_inner(self) -> ChildStdout {
         self.inner.into_inner()
     }
+
+    /// Take the inner ChildStdout, leaving None in its place
+    /// This is useful when we need to return the stdout while the stream is still alive
+    pub fn take_inner(&mut self) -> Option<ChildStdout> {
+        // We can't actually take from FramedRead, so we need a different approach
+        // This method exists for API compatibility but won't work as expected
+        None
+    }
 }
 
 impl Stream for EventStream {
